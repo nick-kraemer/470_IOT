@@ -1,0 +1,218 @@
+<?php
+/*  SSU IoT Lab – One-File Solution  */
+
+$servername = "localhost";
+$username   = "u897319688_db_NickKraemer";
+$password   = "Nickkraemer10";
+$dbname     = "u897319688_NickKraemer";
+
+/* ADDED: turn mysqli errors into exceptions so we can catch/rollback cleanly */
+mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+
+$conn = new mysqli($servername, $username, $password, $dbname);
+if ($conn->connect_error) { die("Connection failed: " . $conn->connect_error); }
+
+/* ADDED: a small notice string to show success/failure without killing the page */
+$notice = "";
+
+/* ---------- 1. Handle incoming data (optional insert) ---------- */
+if (isset($_GET['nodeId']) && isset($_GET['nodeTemp'])) {
+    $varId   = $_GET['nodeId'];
+    $varTemp = $_GET['nodeTemp'];
+    $varHum  = $_GET['humidity']     ?? null;
+    $varTime = $_GET['timeReceived'] ?? null;
+
+    try {
+        /* ADDED: run the insert in a tiny transaction */
+        $conn->begin_transaction();
+
+        // insert (humidity optional, time auto if null)
+        if ($varHum === null || $varHum === '') {
+            $sql  = "INSERT INTO sensor_data (node_name, temperature, time_received)
+                     VALUES (?, ?, COALESCE(?, NOW()))";
+            $stmt = $conn->prepare($sql);
+            $stmt->bind_param("sds", $varId, $varTemp, $varTime);
+        } else {
+            $sql  = "INSERT INTO sensor_data (node_name, temperature, humidity, time_received)
+                     VALUES (?, ?, ?, COALESCE(?, NOW()))";
+            $stmt = $conn->prepare($sql);
+            $stmt->bind_param("sdds", $varId, $varTemp, $varHum, $varTime);
+        }
+
+        $stmt->execute();
+        $conn->commit();
+        $notice = "✅ New record added for {$varId}";
+        $stmt->close();
+
+    } catch (mysqli_sql_exception $e) {
+        /* ADDED: rollback on any error and set a friendly message */
+        $conn->rollback();
+        $code = $e->getCode();
+        if ($code == 1062) {
+            $notice = "⚠️ Duplicate ignored: same node & time already exist.";
+        } elseif ($code == 1452) {
+            $notice = "❌ Rejected: nodeId '{$varId}' is not registered.";
+        } elseif ($code == 3819) {
+            $notice = "❌ Rejected: value violates range constraints.";
+        } else {
+            $notice = "❌ Insert error #{$code}: " . $e->getMessage();
+        }
+    }
+}
+
+/* ---------- 2. Query tables for display ---------- */
+function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+
+$nodes = [];
+$res1 = $conn->query("SELECT node_name, manufacturer, longitude, latitude
+                      FROM sensor_register ORDER BY node_name ASC");
+if ($res1) while ($r=$res1->fetch_assoc()) $nodes[]=$r;
+
+$data = [];
+$res2 = $conn->query("SELECT node_name, time_received, temperature, humidity
+                      FROM sensor_data
+                      ORDER BY node_name ASC, time_received ASC");
+if ($res2) while ($r=$res2->fetch_assoc()) $data[]=$r;
+
+/* ---------- 2b. Averages for node_1 (ADDED) ---------- */
+$avgNode = 'node_1';
+$avgRow  = ['cnt' => 0, 'avg_temp' => null, 'avg_hum' => null];
+
+if ($stmtAvg = $conn->prepare("
+    SELECT COUNT(*) AS cnt,
+           ROUND(AVG(temperature), 2) AS avg_temp,
+           ROUND(AVG(humidity), 2)    AS avg_hum
+    FROM sensor_data
+    WHERE node_name = ?
+")) {
+    $stmtAvg->bind_param("s", $avgNode);
+    $stmtAvg->execute();
+
+    // use bind_result/fetch (works even without mysqlnd)
+    $stmtAvg->bind_result($cnt, $avgTemp, $avgHum);
+    if ($stmtAvg->fetch()) {
+        $avgRow = ['cnt' => $cnt, 'avg_temp' => $avgTemp, 'avg_hum' => $avgHum];
+    }
+    $stmtAvg->close();
+}
+
+$conn->close();
+?>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SSU IoT Lab</title>
+<style>
+body{font-family:system-ui,Arial,sans-serif;margin:24px;background:#fafafa;color:#222}
+h1{text-align:center;margin:0 0 12px}
+.banner{max-width:1000px;margin:8px auto 0;padding:10px 12px;border-radius:10px}
+.ok{background:#e6ffed;border:1px solid #b7ebc6}
+.warn{background:#fff7e6;border:1px solid #ffe58f}
+.err{background:#fff1f0;border:1px solid #ffa39e}
+.card{background:#fff;border:1px solid #e6e6e6;border-radius:12px;padding:12px;margin:16px auto;max-width:1000px}
+table{width:100%;border-collapse:collapse;margin:8px 0}
+th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
+thead th{border-bottom:2px solid #ccc;background:#f2f2f2}
+.muted{color:#666;font-size:0.9em}
+
+
+
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<h1>Welcome to SSU IoT Lab</h1>
+
+<!-- ADDED: small notice area that shows success/why an insert was rejected -->
+<?php if ($notice): 
+  $cls = (str_starts_with($notice,'✅') ? 'ok' : (str_starts_with($notice,'⚠️') ? 'warn' : 'err')); ?>
+  <div class="banner <?=$cls?>"><?=h($notice)?></div>
+<?php endif; ?>
+
+<div class="card">
+<h3>Registered Sensor Nodes</h3>
+<table>
+<thead><tr><th>Name</th><th>Manufacturer</th><th>Longitude</th><th>Latitude</th></tr></thead>
+<tbody>
+<?php foreach($nodes as $n): ?>
+<tr>
+<td><?=h($n['node_name'])?></td>
+<td><?=h($n['manufacturer'])?></td>
+<td><?=h($n['longitude'])?></td>
+<td><?=h($n['latitude'])?></td>
+</tr>
+<?php endforeach; ?>
+</tbody>
+</table>
+<div class="muted">Total nodes: <?=count($nodes)?></div>
+</div>
+
+<div class="card">
+  <h3>Sensor Node 1 — Temperature vs Time</h3>
+  <canvas id="chart1"></canvas>
+</div>
+
+
+<div class="card">
+<h3>Data Received (sorted by Node, then Time)</h3>
+<table>
+<thead><tr><th>Node</th><th>Time</th><th>Temperature (°C)</th><th>Humidity (%)</th></tr></thead>
+<tbody>
+<?php foreach($data as $d): ?>
+<tr>
+<td><?=h($d['node_name'])?></td>
+<td><?=h($d['time_received'])?></td>
+<td><?=h($d['temperature'])?></td>
+<td><?=h($d['humidity'])?></td>
+</tr>
+<?php endforeach; ?>
+
+
+</tbody>
+</table>
+<div class="muted">Rows: <?=count($data)?></div>
+</div>
+
+<!-- SIMPLE SUMMARY LINES FOR NODE 1 -->
+<p style="margin:20px 0;font-weight:bold;">
+  The Average Temperature for node 1 has been:
+  <?= isset($avgRow['avg_temp']) && $avgRow['avg_temp'] !== null ? h($avgRow['avg_temp']) . " °C" : "—" ?><br>
+  The Average Humidity for node 1 has been:
+  <?= isset($avgRow['avg_hum']) && $avgRow['avg_hum'] !== null ? h($avgRow['avg_hum']) . " %" : "—" ?>
+</p>
+<script>
+const dataFromPHP = <?php echo json_encode($data); ?>;
+
+// pick node_1 values
+const times = [];
+const temps = [];
+for (let r of dataFromPHP) {
+  if (r.node_name === 'node_1') {
+    times.push(r.time_received);
+    temps.push(parseFloat(r.temperature));
+  }
+}
+
+new Chart(document.getElementById('chart1'), {
+  type: 'bar', // or 'line'
+  data: {
+    labels: times,
+    datasets: [{
+      label: 'Temperature (°C)',
+      data: temps,
+      backgroundColor: 'rgba(70,200,192,0.6)'
+    }]
+  },
+  options: {
+    scales: {
+      x: { title: { display: true, text: 'Time' }},
+      y: { title: { display: true, text: 'Temperature (°C)' }}
+    }
+  }
+});
+</script>
+{"data_id":"1","node_name":"node_1","time_received":"2022-10-01 11:00:00","temperature":"22.5","humidity":"60.0"}//node1 json format
+
+</body>
+</html>
