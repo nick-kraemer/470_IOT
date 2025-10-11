@@ -1,5 +1,5 @@
 <?php
-/*  SSU IoT Lab – One-File Solution  */
+/*  SSU IoT Lab –   */
 
 $servername = "localhost";
 $username   = "u897319688_db_NickKraemer";
@@ -14,6 +14,23 @@ if ($conn->connect_error) { die("Connection failed: " . $conn->connect_error); }
 
 /* ADDED: a small notice string to show success/failure without killing the page */
 $notice = "";
+
+/* ---------- 0. Optional BASE64-encoded message ---------- */
+/*
+   Accept a single query param ?msg=<base64> that decodes to:
+   nodeId=node_3&nodeTemp=34&humidity=70.5&timeReceived=2022-10-01 10:25:01
+   We decode it and populate $_GET so your existing insert logic works unchanged.
+*/
+if (isset($_GET['msg'])) {
+    $decoded = base64_decode($_GET['msg'], true);  // true => strict; false if invalid
+    if ($decoded !== false) {
+        parse_str($decoded, $p);  // turns "a=1&b=2" into ['a'=>'1','b'=>'2']
+        if (!empty($p['nodeId']))         $_GET['nodeId'] = $p['nodeId'];
+        if (!empty($p['nodeTemp']))       $_GET['nodeTemp'] = $p['nodeTemp'];
+        if (isset($p['humidity']))        $_GET['humidity'] = $p['humidity'];
+        if (isset($p['timeReceived']))    $_GET['timeReceived'] = $p['timeReceived'];
+    }
+}
 
 /* ---------- 1. Handle incoming data (optional insert) ---------- */
 if (isset($_GET['nodeId']) && isset($_GET['nodeTemp'])) {
