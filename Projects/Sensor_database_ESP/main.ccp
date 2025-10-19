@@ -5,8 +5,8 @@
 #include <DHT.h>
 
 // ---------- WiFi Settings ----------
-const char* WIFI_SSID     = "my wifi";
-const char* WIFI_PASSWORD = "my wifi password";
+const char* WIFI_SSID     = "NETGEAR35";
+const char* WIFI_PASSWORD = "put correct password";
 
 // ---------- PHP Endpoint ----------
 const char* BASE_URL = "https://nickkaemer.com/Sensor_data2.php";
@@ -58,6 +58,42 @@ String urlEncode(const String& s) {
   return out;
 }
 
+// Get current Los Angeles time in "YYYY-MM-DD HH:MM:SS"
+String getCurrentTime() {
+  connectWiFi();
+
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();
+
+  HTTPClient http;
+  if (!http.begin(*client, "https://timeapi.io/api/Time/current/zone?timeZone=America/Los_Angeles"))
+    return "";
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return "";
+  }
+
+  String body = http.getString();
+  http.end();
+
+  // Parse the "dateTime" field (e.g. "2025-10-18T18:31:00.0000000")
+  int start = body.indexOf("\"dateTime\":\"");
+  if (start < 0) return "";
+  start += 12;  // move past "dateTime":"
+  int end = body.indexOf('"', start);
+  if (end < 0) return "";
+
+  String dateTime = body.substring(start, end);
+  dateTime.replace('T', ' ');              // convert ISO 'T' to space
+  if (dateTime.length() > 19)              // trim off milliseconds if present
+      dateTime = dateTime.substring(0, 19);
+
+  return dateTime;  // "YYYY-MM-DD HH:MM:SS"
+}
+
+
 // ---------- Send Data ----------
 void sendReading(const char* nodeId) {
   float t = dht.readTemperature();
@@ -68,8 +104,12 @@ void sendReading(const char* nodeId) {
     return;
   }
 
-  // Hardcoded time (adjust as needed)
-  String timeReceived = "2025-10-18 15:31:00";
+  String timeReceived = getCurrentTime();
+if (timeReceived == "") {
+  Serial.println("❌ Could not fetch time; not sending.");
+  return;
+}
+
 
   // Build full GET URL
   String url = String(BASE_URL) +
