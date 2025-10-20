@@ -6,7 +6,7 @@
 
 // ---------- WiFi Settings ----------
 const char* WIFI_SSID     = "NETGEAR35";
-const char* WIFI_PASSWORD = "put correct password";
+const char* WIFI_PASSWORD = "rapidrabbit565";
 
 // ---------- PHP Endpoint ----------
 const char* BASE_URL = "https://nickkaemer.com/Sensor_data2.php";
