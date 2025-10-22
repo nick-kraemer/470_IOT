@@ -31,6 +31,7 @@ void wifiConnect();
 String urlEncode(const String& s);
 bool transmit(const char* nodeId, float t, float h, const String& ts);
 String read_time();
+void promptTimeZoneViaSerial(unsigned long wait_ms = 15000);
 
 void setup() {
   Serial.begin(9600);
@@ -38,6 +39,7 @@ void setup() {
   buttonsBegin();
   sensorsBegin();
   wifiConnect(); // optional early connect
+  promptTimeZoneViaSerial(); 
   Serial.println("Ready.");
 }
 
