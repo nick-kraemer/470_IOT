@@ -1,0 +1,146 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>               // <-- NEW
+
+// ======== WIFI ========
+const char* WIFI_SSID = "NETGEAR35";
+const char* WIFI_PASS = "rapidrabbit565";
+
+// ======== ENDPOINT (JSON) ========
+
+const char* STATE_URL = "https://nickkaemer.com/results.txt";
+
+// ======== PINS ========
+const int LED_PIN = 5;   // D1 (GPIO5) external single LED -> resistor -> GND
+const int BTN_PIN = 0;   // D3 (GPIO0) button to GND (INPUT_PULLUP)
+
+// RGB LED (PWM-capable pins on ESP8266)
+const int RGB_R = 14;    // D5 (GPIO14)
+const int RGB_G = 12;    // D6 (GPIO12)
+const int RGB_B = 13;    // D7 (GPIO13)
+
+// Debounce
+bool lastBtn = HIGH;
+unsigned long lastEdge = 0;
+const unsigned long DEBOUNCE_MS = 60;
+
+void wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) { delay(350); Serial.print("."); }
+  Serial.printf("\nWiFi connected! IP=%s\n", WiFi.localIP().toString().c_str());
+}
+
+int httpsGET(const String& url, String& bodyOut) {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();            // OK for class/demo
+  client->setBufferSizes(512, 512); // helps some shared hosts
+
+  HTTPClient http;
+  Serial.println("GET -> " + url);
+  if (!http.begin(*client, url)) { Serial.println("http.begin() failed"); return -999; }
+
+  http.useHTTP10(true);
+  http.setTimeout(10000);
+  http.setReuse(false);
+
+  int code = http.GET();
+  if (code > 0) bodyOut = http.getString();
+  http.end();
+  return code;
+}
+
+// Return the JSON body (empty string if failed)
+String readJsonOnce() {
+  wifiConnect();
+  delay(200);
+
+  String body;
+  int code = httpsGET(STATE_URL, body);
+  Serial.printf("<- HTTPS %d\n", code);
+  if (code == HTTP_CODE_OK) {
+    body.trim();
+    Serial.println("Body: " + body);
+    return body;
+  }
+  Serial.println("Failed to fetch JSON");
+  return "";
+}
+
+// Clamp helper
+static inline int clamp255(int v){ return (v < 0 ? 0 : (v > 255 ? 255 : v)); }
+
+// Apply from JSON string (returns true on success)
+bool applyFromJson(const String& json) {
+  if (json.length() == 0) return false;
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    Serial.print("JSON parse error: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  const char* led = doc["led"] | "OFF";
+  int r = clamp255(doc["rgb"]["r"] | 0);
+  int g = clamp255(doc["rgb"]["g"] | 0);
+  int b = clamp255(doc["rgb"]["b"] | 0);
+
+  bool on = (strcmp(led, "ON") == 0);
+
+  if (on) {
+    digitalWrite(LED_PIN, HIGH);
+    analogWrite(RGB_R, r);
+    analogWrite(RGB_G, g);
+    analogWrite(RGB_B, b);
+    Serial.printf("LED: ON  RGB(%d,%d,%d)\n", r, g, b);
+  } else {
+    digitalWrite(LED_PIN, LOW);
+    analogWrite(RGB_R, 0);
+    analogWrite(RGB_G, 0);
+    analogWrite(RGB_B, 0);
+    Serial.println("LED: OFF  RGB(0,0,0)");
+  }
+  return true;
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_PIN, OUTPUT);  digitalWrite(LED_PIN, LOW);
+  pinMode(BTN_PIN, INPUT_PULLUP);
+
+  // RGB pins
+  pinMode(RGB_R, OUTPUT);
+  pinMode(RGB_G, OUTPUT);
+  pinMode(RGB_B, OUTPUT);
+  analogWriteRange(255);     // match 0..255 slider range
+
+  wifiConnect();
+
+  // Sync once at boot
+  String json = readJsonOnce();
+  applyFromJson(json);
+}
+
+void loop() {
+  // Button-triggered ONLY (no periodic polling)
+  bool b = digitalRead(BTN_PIN);
+  unsigned long now = millis();
+
+  if (b != lastBtn) { lastEdge = now; lastBtn = b; }
+
+  if (b == LOW && (now - lastEdge) > DEBOUNCE_MS) {
+    Serial.println("Button pressed -> check server");
+    String json = readJsonOnce();
+    applyFromJson(json);
+
+    // wait for release
+    while (digitalRead(BTN_PIN) == LOW) delay(5);
+    delay(40);
+  }
+}
