@@ -5,8 +5,8 @@
 #include "DHT.h"
 
 /* ====== EDIT THESE ====== */
-const char* WIFI_SSID = "NETGEAR35";
-const char* WIFI_PASS = "rapidrabbit565";
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
 const char* SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbyCfkwiN6fx2OO8foIe3YA7bTgUee3uwYbcDaVHYiHaajliPbeaf0q8orrculm9Awc/exec";
 /* ======================= */
