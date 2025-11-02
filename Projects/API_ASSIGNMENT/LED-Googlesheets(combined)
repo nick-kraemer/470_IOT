@@ -1,0 +1,234 @@
+// Combined main.cpp for ESP8266 (PlatformIO)
+// - BTN1 (D3/GPIO0): Fetch JSON -> control LED + RGB
+// - BTN2 (D4/GPIO2): Read DHT11 -> send to Google Apps Script
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>
+#include "DHT.h"
+
+// ======== WIFI (shared) ========
+const char* WIFI_SSID = "NETGEAR35";
+const char* WIFI_PASS = "rapidrabbit565";
+
+// ======== ENDPOINTS ========
+const char* STATE_URL  = "https://nickkaemer.com/results.txt"; // JSON for LED/RGB
+const char* SCRIPT_URL =
+  "https://script.google.com/macros/s/AKfycbyCfkwiN6fx2OO8foIe3YA7bTgUee3uwYbcDaVHYiHaajliPbeaf0q8orrculm9Awc/exec"; // Sheet logging
+
+// ======== PINS ========
+// Single LED + Button 1 (JSON sync)
+const int LED_PIN = 5;        // D1 (GPIO5) external LED -> resistor -> GND
+const int BTN1_PIN = 0;       // D3 (GPIO0) button to GND (INPUT_PULLUP)
+
+// RGB LED (PWM-capable pins on ESP8266)
+const int RGB_R = 14;         // D5 (GPIO14)
+const int RGB_G = 12;         // D6 (GPIO12)
+const int RGB_B = 13;         // D7 (GPIO13)
+
+// DHT + Button 2 (send reading)
+#define DHT_PIN   D2          // GPIO4
+#define DHT_TYPE  DHT11       // change to DHT22 if you switch sensors
+const int BTN2_PIN = D4;      // GPIO2 (D4) button to GND (INPUT_PULLUP)
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ======== Debounce helper ========
+struct DebouncedButton {
+  uint8_t pin;
+  bool lastRaw = HIGH;
+  bool lastStable = HIGH;
+  bool armed = true;
+  unsigned long lastChange = 0;
+  unsigned long lastFire = 0;
+};
+
+const unsigned long DEBOUNCE_MS = 80;
+const unsigned long LOCKOUT_MS  = 300;
+
+bool updateAndFire(DebouncedButton &b) {
+  bool raw = digitalRead(b.pin);
+  unsigned long now = millis();
+
+  if (raw != b.lastRaw) {
+    b.lastRaw = raw;
+    b.lastChange = now;
+  }
+  if (now - b.lastChange >= DEBOUNCE_MS) {
+    b.lastStable = raw;
+  }
+
+  // fire once on press (LOW), with simple lockout
+  if (b.lastStable == LOW && b.armed && (now - b.lastFire > LOCKOUT_MS)) {
+    b.armed = false;
+    b.lastFire = now;
+    return true; // pressed event
+  }
+
+  if (b.lastStable == HIGH && (now - b.lastFire > LOCKOUT_MS)) {
+    b.armed = true; // re-arm after release
+  }
+  return false;
+}
+
+DebouncedButton btnJson{(uint8_t)BTN1_PIN};
+DebouncedButton btnDht{(uint8_t)BTN2_PIN};
+
+// ======== WiFi helper (shared) ========
+void wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.printf("\nWiFi connected! IP=%s\n", WiFi.localIP().toString().c_str());
+}
+
+// ======== HTTPS GET (shared) ========
+int httpsGET(const String& url, String& bodyOut) {
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();            // OK for demo/class uses
+  client->setBufferSizes(512, 512); // helps some shared hosts
+
+  HTTPClient http;
+  Serial.println("GET -> " + url);
+  if (!http.begin(*client, url)) { Serial.println("http.begin() failed"); return -999; }
+
+  http.useHTTP10(true);
+  http.setTimeout(15000);
+  http.setReuse(false);
+
+  int code = http.GET();
+  if (code > 0) bodyOut = http.getString();
+  http.end();
+  return code;
+}
+
+// ======== JSON -> LED/RGB (from STATE_URL) ========
+String readJsonOnce() {
+  wifiConnect();
+  delay(100);
+  String body;
+  int code = httpsGET(STATE_URL, body);
+  Serial.printf("<- HTTPS %d\n", code);
+  if (code == HTTP_CODE_OK) {
+    body.trim();
+    Serial.println("Body: " + body);
+    return body;
+  }
+  Serial.println("Failed to fetch JSON");
+  return "";
+}
+
+static inline int clamp255(int v){ return (v < 0 ? 0 : (v > 255 ? 255 : v)); }
+
+bool applyFromJson(const String& json) {
+  if (json.length() == 0) return false;
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    Serial.print("JSON parse error: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  const char* led = doc["led"] | "OFF";
+  int r = clamp255(doc["rgb"]["r"] | 0);
+  int g = clamp255(doc["rgb"]["g"] | 0);
+  int b = clamp255(doc["rgb"]["b"] | 0);
+
+  bool on = (strcmp(led, "ON") == 0);
+
+  if (on) {
+    digitalWrite(LED_PIN, HIGH);
+    analogWrite(RGB_R, r);
+    analogWrite(RGB_G, g);
+    analogWrite(RGB_B, b);
+    Serial.printf("LED: ON  RGB(%d,%d,%d)\n", r, g, b);
+  } else {
+    digitalWrite(LED_PIN, LOW);
+    analogWrite(RGB_R, 0);
+    analogWrite(RGB_G, 0);
+    analogWrite(RGB_B, 0);
+    Serial.println("LED: OFF  RGB(0,0,0)");
+  }
+  return true;
+}
+
+// ======== DHT -> Google Sheet (from SCRIPT_URL) ========
+bool sendToSheet(float tempC) {
+  String url = String(SCRIPT_URL) + "?sensor=" + String(tempC, 1);
+
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure(); // demo
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(15000);
+
+  Serial.println("GET -> " + url);
+  if (!http.begin(*client, url)) { Serial.println("http.begin failed"); return false; }
+
+  int code = http.GET();
+  String body = (code > 0) ? http.getString() : "";
+  http.end();
+
+  Serial.printf("<- HTTPS %d\n", code);
+  if (body.length()) Serial.println(body);
+  return (code > 0);
+}
+
+void sendReadingOnce() {
+  float t = dht.readTemperature(); // Celsius
+  if (isnan(t)) { Serial.println("DHT read failed"); return; }
+  Serial.printf("Temp = %.1f C\n", t);
+  wifiConnect();
+  if (sendToSheet(t)) Serial.println("Logged ✔");
+  else Serial.println("Send failed");
+}
+
+// ======== setup/loop ========
+void setup() {
+  Serial.begin(9600);
+
+  // I/O
+  pinMode(LED_PIN, OUTPUT);  digitalWrite(LED_PIN, LOW);
+  pinMode(BTN1_PIN, INPUT_PULLUP);
+  pinMode(BTN2_PIN, INPUT_PULLUP);
+
+  // RGB pins
+  pinMode(RGB_R, OUTPUT);
+  pinMode(RGB_G, OUTPUT);
+  pinMode(RGB_B, OUTPUT);
+  analogWriteRange(255); // 0..255
+
+  // DHT
+  dht.begin();
+
+  // WiFi up-front
+  wifiConnect();
+
+  // Optional: perform an initial JSON sync at boot
+  String json = readJsonOnce();
+  applyFromJson(json);
+
+  Serial.println("Ready. BTN1 (D3) -> JSON sync; BTN2 (D4) -> send DHT reading.");
+}
+
+void loop() {
+  if (updateAndFire(btnJson)) {
+    Serial.println("BTN1 pressed -> fetch/apply JSON");
+    String json = readJsonOnce();
+    applyFromJson(json);
+  }
+
+  if (updateAndFire(btnDht)) {
+    Serial.println("BTN2 pressed -> read DHT + send once");
+    sendReadingOnce();
+  }
+
+  delay(5);
+}
