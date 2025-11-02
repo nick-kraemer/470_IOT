@@ -5,8 +5,8 @@
 #include <ArduinoJson.h>               // <-- NEW
 
 // ======== WIFI ========
-const char* WIFI_SSID = "wifi";
-const char* WIFI_PASS = "password";
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
 
 // ======== ENDPOINT (JSON) ========
 
