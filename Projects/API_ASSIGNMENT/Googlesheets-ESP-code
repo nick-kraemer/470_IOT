@@ -1,0 +1,90 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
+#include "DHT.h"
+
+/* ====== EDIT THESE ====== */
+const char* WIFI_SSID = "NETGEAR35";
+const char* WIFI_PASS = "rapidrabbit565";
+const char* SCRIPT_URL =
+  "https://script.google.com/macros/s/AKfycbyCfkwiN6fx2OO8foIe3YA7bTgUee3uwYbcDaVHYiHaajliPbeaf0q8orrculm9Awc/exec";
+/* ======================= */
+
+#define DHT_PIN   D2         // GPIO4
+#define DHT_TYPE  DHT11      // change to DHT22 if you switch sensors
+#define BTN_PIN   D4       // GPIO16, button to GND (INPUT_PULLUP)
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+/* --- one-shot, debounced button --- */
+bool lastRaw = HIGH, lastStable = HIGH, armed = true;
+unsigned long lastChange = 0, lastFire = 0;
+const unsigned long DEBOUNCE_MS = 80;
+const unsigned long LOCKOUT_MS  = 300;
+
+void wifiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("WiFi → %s", WIFI_SSID);
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
+}
+
+bool sendToSheet(float tempC) {
+  String url = String(SCRIPT_URL) + "?sensor=" + String(tempC, 1);
+
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure();                    // fine for class/demo
+
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(15000);
+
+  Serial.println("GET -> " + url);
+  if (!http.begin(*client, url)) { Serial.println("http.begin failed"); return false; }
+
+  int code = http.GET();
+  String body = (code > 0) ? http.getString() : "";
+  http.end();
+
+  Serial.printf("<- HTTPS %d\n", code);
+  if (body.length()) Serial.println(body);
+  return (code > 0);                         // treat any response as “sent”
+}
+
+void sendReadingOnce() {
+  float t = dht.readTemperature();           // Celsius
+  if (isnan(t)) { Serial.println("DHT read failed"); return; }
+  Serial.printf("Temp = %.1f C\n", t);
+  wifiConnect();
+  if (sendToSheet(t)) Serial.println("Logged ✔");
+  else Serial.println("Send failed");
+}
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(BTN_PIN, INPUT_PULLUP);            // S → D0, other leg → GND
+  dht.begin();
+  wifiConnect();
+  Serial.println("Press the button to send a reading.");
+}
+
+void loop() {
+  bool raw = digitalRead(BTN_PIN);
+  unsigned long now = millis();
+
+  if (raw != lastRaw) { lastChange = now; lastRaw = raw; }
+  if (now - lastChange >= DEBOUNCE_MS) lastStable = raw;
+
+  if (lastStable == LOW && armed && (now - lastFire > LOCKOUT_MS)) {
+    armed = false;
+    lastFire = now;
+    sendReadingOnce();                       // exactly once per press
+  }
+
+  if (lastStable == HIGH && (now - lastFire > LOCKOUT_MS)) {
+    armed = true;                            // re-arm after release
+  }
+}
