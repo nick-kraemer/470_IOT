@@ -1,6 +1,7 @@
 // Combined main.cpp for ESP8266 (PlatformIO)
-// - BTN1 (D3/GPIO0): Fetch JSON -> control LED + RGB
-// - BTN2 (D4/GPIO2): Read DHT11 -> send to Google Apps Script
+// BTN1 (D3 / GPIO0): fetch JSON -> control LED + RGB
+// BTN2 (D4 / GPIO2): read DHT11 -> send to Google Apps Script
+// NEW: Interrupt-driven queue so presses during long work are not missed.
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -19,78 +20,72 @@ const char* SCRIPT_URL =
   "https://script.google.com/macros/s/AKfycbyCfkwiN6fx2OO8foIe3YA7bTgUee3uwYbcDaVHYiHaajliPbeaf0q8orrculm9Awc/exec"; // Sheet logging
 
 // ======== PINS ========
-// Single LED + Button 1 (JSON sync)
-const int LED_PIN = 5;        // D1 (GPIO5) external LED -> resistor -> GND
-const int BTN1_PIN = 0;       // D3 (GPIO0) button to GND (INPUT_PULLUP)
-
-// RGB LED (PWM-capable pins on ESP8266)
-const int RGB_R = 14;         // D5 (GPIO14)
-const int RGB_G = 12;         // D6 (GPIO12)
-const int RGB_B = 13;         // D7 (GPIO13)
-
-// DHT + Button 2 (send reading)
-#define DHT_PIN   D2          // GPIO4
-#define DHT_TYPE  DHT11       // change to DHT22 if you switch sensors
-const int BTN2_PIN = D4;      // GPIO2 (D4) button to GND (INPUT_PULLUP)
+const int LED_PIN  = 5;   // D1 (GPIO5)
+const int BTN1_PIN = 0;   // D3 (GPIO0)  -> GND (INPUT_PULLUP)
+const int RGB_R    = 14;  // D5 (GPIO14)
+const int RGB_G    = 12;  // D6 (GPIO12)
+const int RGB_B    = 13;  // D7 (GPIO13)
+#define  DHT_PIN   D2     // GPIO4
+#define  DHT_TYPE  DHT11
+const int BTN2_PIN = D4;  // GPIO2 (D4)  -> GND (INPUT_PULLUP)
 
 DHT dht(DHT_PIN, DHT_TYPE);
 
-// ======== Debounce helper ========
-struct DebouncedButton {
-  uint8_t pin;
-  bool lastRaw = HIGH;
-  bool lastStable = HIGH;
-  bool armed = true;
-  unsigned long lastChange = 0;
-  unsigned long lastFire = 0;
-};
+// ======== Task queue (bitmask) ========
+enum Task : uint8_t { TASK_NONE = 0, TASK_JSON = 1, TASK_DHT = 2 };
 
-const unsigned long DEBOUNCE_MS = 80;
-const unsigned long LOCKOUT_MS  = 300;
+// Queue drained in loop(); presses are added from ISRs.
+static volatile uint8_t isrPendingBits = 0;   // set by ISRs only
+static uint8_t pendingTasks = 0;              // consumed in loop()
 
-bool updateAndFire(DebouncedButton &b) {
-  bool raw = digitalRead(b.pin);
-  unsigned long now = millis();
+// ======== Interrupt debouncing ========
+// Use short debounce inside ISR to avoid multiple queue adds due to bounce.
+static const uint16_t ISR_DEBOUNCE_MS = 120;
+static volatile uint32_t lastIsrBtn1 = 0;
+static volatile uint32_t lastIsrBtn2 = 0;
 
-  if (raw != b.lastRaw) {
-    b.lastRaw = raw;
-    b.lastChange = now;
+// NOTE: On ESP8266 the attribute is ICACHE_RAM_ATTR
+void ICACHE_RAM_ATTR onBtn1Fall() {
+  uint32_t now = millis();
+  if (now - lastIsrBtn1 > ISR_DEBOUNCE_MS) {
+    isrPendingBits |= TASK_JSON;   // record a JSON task
+    lastIsrBtn1 = now;
   }
-  if (now - b.lastChange >= DEBOUNCE_MS) {
-    b.lastStable = raw;
+}
+void ICACHE_RAM_ATTR onBtn2Fall() {
+  uint32_t now = millis();
+  if (now - lastIsrBtn2 > ISR_DEBOUNCE_MS) {
+    isrPendingBits |= TASK_DHT;    // record a DHT task
+    lastIsrBtn2 = now;
   }
-
-  // fire once on press (LOW), with simple lockout
-  if (b.lastStable == LOW && b.armed && (now - b.lastFire > LOCKOUT_MS)) {
-    b.armed = false;
-    b.lastFire = now;
-    return true; // pressed event
-  }
-
-  if (b.lastStable == HIGH && (now - b.lastFire > LOCKOUT_MS)) {
-    b.armed = true; // re-arm after release
-  }
-  return false;
 }
 
-DebouncedButton btnJson{(uint8_t)BTN1_PIN};
-DebouncedButton btnDht{(uint8_t)BTN2_PIN};
-
-// ======== WiFi helper (shared) ========
+// ======== WiFi helper ========
 void wifiConnect() {
   if (WiFi.status() == WL_CONNECTED) return;
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.printf("Connecting to %s", WIFI_SSID);
-  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - start > 20000) {
+      Serial.println("\nWiFi connect timeout, retrying...");
+      WiFi.disconnect();
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      start = millis();
+    }
+  }
   Serial.printf("\nWiFi connected! IP=%s\n", WiFi.localIP().toString().c_str());
 }
 
 // ======== HTTPS GET (shared) ========
 int httpsGET(const String& url, String& bodyOut) {
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure();            // OK for demo/class uses
-  client->setBufferSizes(512, 512); // helps some shared hosts
+  client->setInsecure();            // for demo
+  client->setBufferSizes(512, 512);
 
   HTTPClient http;
   Serial.println("GET -> " + url);
@@ -106,7 +101,7 @@ int httpsGET(const String& url, String& bodyOut) {
   return code;
 }
 
-// ======== JSON -> LED/RGB (from STATE_URL) ========
+// ======== JSON -> LED/RGB ========
 String readJsonOnce() {
   wifiConnect();
   delay(100);
@@ -158,12 +153,12 @@ bool applyFromJson(const String& json) {
   return true;
 }
 
-// ======== DHT -> Google Sheet (from SCRIPT_URL) ========
+// ======== DHT -> Google Sheet ========
 bool sendToSheet(float tempC) {
   String url = String(SCRIPT_URL) + "?sensor=" + String(tempC, 1);
 
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure(); // demo
+  client->setInsecure();
 
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -194,39 +189,51 @@ void sendReadingOnce() {
 void setup() {
   Serial.begin(9600);
 
-  // I/O
   pinMode(LED_PIN, OUTPUT);  digitalWrite(LED_PIN, LOW);
   pinMode(BTN1_PIN, INPUT_PULLUP);
   pinMode(BTN2_PIN, INPUT_PULLUP);
 
-  // RGB pins
   pinMode(RGB_R, OUTPUT);
   pinMode(RGB_G, OUTPUT);
   pinMode(RGB_B, OUTPUT);
-  analogWriteRange(255); // 0..255
+  analogWriteRange(255);
 
-  // DHT
   dht.begin();
-
-  // WiFi up-front
   wifiConnect();
 
-  // Optional: perform an initial JSON sync at boot
+  // Initial JSON sync
   String json = readJsonOnce();
   applyFromJson(json);
+
+  // Attach interrupts on falling edge (pressed -> GND)
+  attachInterrupt(digitalPinToInterrupt(BTN1_PIN), onBtn1Fall, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN2_PIN), onBtn2Fall, FALLING);
 
   Serial.println("Ready. BTN1 (D3) -> JSON sync; BTN2 (D4) -> send DHT reading.");
 }
 
-void loop() {
-  if (updateAndFire(btnJson)) {
-    Serial.println("BTN1 pressed -> fetch/apply JSON");
-    String json = readJsonOnce();
-    applyFromJson(json);
-  }
+inline Task nextTaskFromMask(uint8_t &mask) {
+  if (mask & TASK_JSON) { mask &= ~TASK_JSON; return TASK_JSON; }
+  if (mask & TASK_DHT)  { mask &= ~TASK_DHT;  return TASK_DHT;  }
+  return TASK_NONE;
+}
 
-  if (updateAndFire(btnDht)) {
-    Serial.println("BTN2 pressed -> read DHT + send once");
+void loop() {
+  // 1) Atomically grab any ISR-captured presses and move them into the queue.
+  noInterrupts();
+  uint8_t newlyPressed = isrPendingBits;
+  isrPendingBits = 0;
+  interrupts();
+  pendingTasks |= newlyPressed;
+
+  // 2) Run at most one task per loop (serialized work).
+  Task t = nextTaskFromMask(pendingTasks);
+  if (t == TASK_JSON) {
+    Serial.println("Run: fetch/apply JSON");
+    String j = readJsonOnce();
+    applyFromJson(j);
+  } else if (t == TASK_DHT) {
+    Serial.println("Run: read DHT + send");
     sendReadingOnce();
   }
 
