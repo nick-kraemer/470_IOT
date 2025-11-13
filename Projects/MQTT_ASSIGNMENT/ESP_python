@@ -1,0 +1,155 @@
+//-----------------------------
+// Title: MQTT + DHT11 (Temp+Hum JSON on Button Press)
+//-----------------------------
+
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
+#include <DHT.h>  // DHT sensor library
+
+// ---------- WiFi ----------
+const char* ssid = "";
+const char* password = "";
+
+// ---------- MQTT ----------
+const char* mqtt_server = "ccc14b57a7ad419f8a69475c6f57d90f.s1.eu.hivemq.cloud";
+const char* publishTopic = "Temp";     // not used now; JSON goes to "TempSensor" below
+const char* subscribeTopic = "LED";    // LED control
+
+// ---------- Pins ----------
+#define LED_PIN    D5       // external LED to GND (active-HIGH)
+#define DHTPIN     D2       // DHT11 data pin
+#define DHTTYPE    DHT11
+#define BUTTON_PIN D3       // button to GND (uses internal pull-up) NOTE: GPIO0 affects boot mode
+
+// ---------- Globals ----------
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long lastMsg = 0;
+#define MSG_BUFFER_SIZE 50
+char msg[MSG_BUFFER_SIZE];
+
+// button state tracking (edge detect + debounce)
+bool lastButtonState = HIGH;               // INPUT_PULLUP -> idle HIGH
+unsigned long lastDebounceMs = 0;
+const unsigned long debounceMs = 300;
+
+// ---------- WiFi ----------
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to "); Serial.println(ssid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP address: "); Serial.println(WiFi.localIP());
+}
+
+// ---------- MQTT callback ----------
+void callback(char* topic, byte* payload, int length) {
+  Serial.print("Message arrived ["); Serial.print(topic); Serial.print("] ");
+  String message;
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+    message += (char)payload[i];
+  }
+  Serial.println();
+  message.trim();  // handle stray \r\n/space
+
+  if (message == "1" || (length > 0 && payload[0] == '1')) {
+    digitalWrite(LED_PIN, HIGH);
+    Serial.println("LED ON");
+  } else if (message == "0" || (length > 0 && payload[0] == '0')) {
+    digitalWrite(LED_PIN, LOW);
+    Serial.println("LED OFF");
+  }
+}
+
+// ---------- MQTT reconnect ----------
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    String clientId = "ESP8266Client-";
+    clientId += String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str(), "Nickkraemer", "10Cody10")) {
+      Serial.println("connected");
+      uint8_t ok = client.subscribe(subscribeTopic);
+      Serial.print("Subscribed to '"); Serial.print(subscribeTopic);
+      Serial.print("' -> "); Serial.println(ok ? "OK" : "FAIL");
+    } else {
+      Serial.print("failed, rc="); Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// ---------- DHT ----------
+void sensorsBegin() {
+  dht.begin();
+  delay(2000);  // allow DHT to stabilize
+}
+
+bool read_sensor_1(float& t, float& h) {
+  t = dht.readTemperature();
+  h = dht.readHumidity();
+  return !(isnan(t) || isnan(h));
+}
+
+// ---------- Setup ----------
+void setup() {
+  espClient.setInsecure();   // TLS quick-start
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);   // button to GND
+
+  Serial.begin(9600);
+  setup_wifi();
+  client.setServer(mqtt_server, 8883);
+  client.setCallback(callback);
+  sensorsBegin();
+
+  // quick blink to confirm LED pin works
+  digitalWrite(LED_PIN, HIGH); delay(200); digitalWrite(LED_PIN, LOW);
+
+  Serial.println("Ready: Press button on D3 to publish JSON {temp, hum}");
+}
+
+// ---------- Loop ----------
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  // ---- Publish JSON ONLY on button press (edge detect) ----
+  bool current = digitalRead(BUTTON_PIN);  // LOW when pressed
+  unsigned long now = millis();
+
+  // Detect a fresh press (HIGH -> LOW) with debounce
+  if (current == LOW && lastButtonState == HIGH && (now - lastDebounceMs) > debounceMs) {
+    lastDebounceMs = now;
+
+    float t, h;
+    if (read_sensor_1(t, h)) {
+      char json[64];
+      // {"temp":23.4,"hum":55.1}
+      snprintf(json, sizeof(json), "{\"temp\":%.1f,\"hum\":%.1f}", t, h);
+
+      Serial.print("Publishing JSON (button press): ");
+      Serial.println(json);
+
+      // Choose the topic for combined payload:
+      client.publish("TempSensor", json);  // publish on press only
+    } else {
+      Serial.println("DHT read failed!");
+    }
+  }
+
+  lastButtonState = current;
+}
