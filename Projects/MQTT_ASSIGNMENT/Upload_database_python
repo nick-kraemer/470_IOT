@@ -1,0 +1,76 @@
+# relay.py — Subscribe to HiveMQ Cloud and push data into your Hostinger DB
+
+import json
+import paho.mqtt.client as mqtt
+import mysql.connector
+
+# ---------- MQTT (HiveMQ Cloud) ----------
+MQTT_HOST  = "ccc14b57a7ad419f8a69475c6f57d90f.s1.eu.hivemq.cloud"
+MQTT_PORT  = 8883
+MQTT_USER  = "Nickkraemer"
+MQTT_PASS  = ""
+MQTT_TOPIC = "TempSensor"     # ESP publishes JSON here: {"temp":23.4,"hum":55.1}
+
+# ---------- MySQL (Hostinger) ----------
+DB_HOST = "srv868.hstgr.io"
+DB_USER = "u897319688_db_NickKraemer"
+DB_PASS = "Nickkraemer10"
+DB_NAME = "u897319688_NickKraemer"
+NODE_NAME = "node_1"
+
+INSERT_SQL = """
+INSERT INTO sensor_data (node_name, time_received, temperature, humidity)
+VALUES (%s, NOW(), %s, %s)
+"""
+
+# ---------- Database Function ----------
+def push_to_db(temp, hum):
+    try:
+        conn = mysql.connector.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASS,
+            database=DB_NAME
+        )
+      
+   
+        cur = conn.cursor()
+        cur.execute(INSERT_SQL, (NODE_NAME, float(temp), float(hum)))
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"✅ Inserted -> node: {NODE_NAME}, temp: {temp}, hum: {hum}")
+    except Exception as e:
+        print("❌ Database error:", e)
+
+# ---------- MQTT Callbacks ----------
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("✅ Connected to HiveMQ Cloud!")
+        client.subscribe(MQTT_TOPIC)
+        print("Subscribed to:", MQTT_TOPIC)
+    else:
+        print("❌ MQTT connection failed, return code:", rc)
+
+def on_message(client, userdata, msg):
+    payload = msg.payload.decode(errors="ignore").strip()
+    print(f"📩 Received from {msg.topic}: {payload}")
+
+    try:
+        data = json.loads(payload)  # expects {"temp":xx.x,"hum":yy.y}
+        temp = data["temp"]
+        hum = data["hum"]
+        push_to_db(temp, hum)
+    except Exception as e:
+        print("⚠️ Parse or DB error:", e)
+
+# ---------- Main MQTT Setup ----------
+client = mqtt.Client(client_id="relay_node", protocol=mqtt.MQTTv311)
+client.tls_set()  # Use system CA for HiveMQ Cloud
+client.username_pw_set(MQTT_USER, MQTT_PASS)
+client.on_connect = on_connect
+client.on_message = on_message
+
+print("Connecting to HiveMQ Cloud...")
+client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+client.loop_forever()
